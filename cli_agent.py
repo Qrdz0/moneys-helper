@@ -12,7 +12,7 @@ Voice mode runs on a background thread: a wake-word listener waits for
 typed input - you can still type in the terminal at any time.
 
 Install requirements:
-    py -m pip install colorama pyautogui pygetwindow requests SpeechRecognition pyaudio ddgs
+    py -m pip install colorama pyautogui pygetwindow requests SpeechRecognition pyaudio ddgs fastapi uvicorn
 """
 
 import json
@@ -33,6 +33,11 @@ try:
     from ddgs import DDGS            # current DuckDuckGo search package
 except ImportError:
     from duckduckgo_search import DDGS   # old (deprecated) package name
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+import uvicorn
 
 colorama_init(autoreset=True)
 
@@ -507,8 +512,59 @@ def handle_input(user_text):
             return
 
         run_actions(data)
+        return raw
     finally:
         task_lock.release()
+
+
+# ================================================================
+# WEB API — FastAPI on :8000 so the browser can send commands
+# ================================================================
+app = FastAPI(title="money's helper web bridge")
+app.add_middleware(CORSMiddleware, allow_origins=["*"],
+                   allow_methods=["*"], allow_headers=["*"])
+
+
+class CliCommand(BaseModel):
+    text: str
+
+
+def reply_text(raw):
+    """Pull a human-readable sentence out of the model's JSON reply."""
+    try:
+        data = extract_json(raw)
+    except Exception:
+        return raw
+    if isinstance(data, dict):
+        return str(data.get("text") or "Done.")
+    if isinstance(data, list):
+        parts = [str(a.get("text")) for a in data
+                 if isinstance(a, dict) and a.get("text")]
+        if parts:
+            return " ".join(parts)
+    return "Done."
+
+
+@app.post("/cli_command")
+def cli_command(cmd: CliCommand):
+    """Accept {"text": "..."} from the web app, run it like typed input."""
+    raw = handle_input(cmd.text)
+    if raw is None:
+        return JSONResponse(status_code=500,
+                            content={"status": "error",
+                                     "text": "Request failed - check the terminal."})
+    return {"status": "ok", "text": reply_text(raw), "raw": raw}
+
+
+def run_api_server():
+    """Block forever inside this daemon thread (terminal keeps working)."""
+    config = uvicorn.Config(app, host="127.0.0.1", port=8000,
+                            log_level="warning")
+    try:
+        uvicorn.Server(config).run()
+    except OSError as e:
+        print(Fore.RED + f"web api off (port 8000 unavailable): {e}"
+              + Style.RESET_ALL)
 
 
 # ================================================================
@@ -594,11 +650,14 @@ def main():
     print(Fore.CYAN + Style.BRIGHT + "money's helper - CLI AI agent" + Style.RESET_ALL)
     print(Fore.CYAN + Style.DIM +
           f"model: {MODEL}   (change MODEL in this file for phi4:14b)\n"
-          f"voice: say \"{VOICE_WAKE_WORD}\" any time   |   type 'exit' or Ctrl+C to quit"
+          f"voice: say \"{VOICE_WAKE_WORD}\" any time   |   type 'exit' or Ctrl+C to quit\n"
+          f"api  : POST http://localhost:8000/cli_command   (browser bridge)"
           + Style.RESET_ALL)
 
     # background wake-word listener (typing keeps working in parallel)
     threading.Thread(target=voice_loop, daemon=True, name="voice-listener").start()
+    # background web server (browser commands land in the same pipeline)
+    threading.Thread(target=run_api_server, daemon=True, name="api-server").start()
 
     while True:
         try:
